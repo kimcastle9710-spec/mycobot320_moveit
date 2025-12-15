@@ -18,7 +18,7 @@ ARM_JOINT_NAMES = [
 ]
 GRIPPER_JOINT_NAME = 'gripper_controller' 
 GRIPPER_OPEN_VAL = 0.0
-GRIPPER_CLOSE_VAL = -0.7 
+GRIPPER_CLOSE_VAL = -0.8
 
 class CubeController(Node):
     def __init__(self):
@@ -80,11 +80,19 @@ class CubeController(Node):
         res_future.add_done_callback(self.start_descent)
 
     def start_descent(self, future):
-        # 실제 하강 시작
-        z_grip = self.current_target_z + 0.17 
-        self.get_logger().info("⬇️ Descending to Grip...")
+        # 큐브 바로 위까지 접근 (높이 조절 필요하면 여기서)
+        z_grip = self.current_target_z + 0.20 
+        self.get_logger().info("⬇️ Descending to Grip (Linear)...")
         
-        future_down = self.send_pose_goal(self.current_target_x, self.current_target_y, z_grip, wait=False)
+        # [수정] linear_motion=True 추가! -> 이제 직선으로만 내려감
+        future_down = self.send_pose_goal(
+            self.current_target_x, 
+            self.current_target_y, 
+            z_grip, 
+            wait=False, 
+            strict_constraints=True, 
+            linear_motion=True 
+        )
         future_down.add_done_callback(self.on_down_complete)
 
     def on_down_complete(self, future):
@@ -102,7 +110,15 @@ class CubeController(Node):
         z_lift = self.current_target_z + 0.25
         self.get_logger().info("⬆️ Lifting...")
         
-        lift_future = self.send_pose_goal(self.current_target_x, self.current_target_y, z_lift, wait=False)
+        # [수정] 들어올릴 때도 직선(LIN)으로, 자세 잡고(Strict) 올라가게 설정
+        lift_future = self.send_pose_goal(
+            self.current_target_x, 
+            self.current_target_y, 
+            z_lift, 
+            wait=False, 
+            strict_constraints=True, # 자세 유지 (흔들지 않음)
+            linear_motion=True       # 직선 이동 (꼬불거리지 않음)
+        )
         lift_future.add_done_callback(self.on_lift_complete)
 
     def on_lift_complete(self, future):
@@ -135,13 +151,68 @@ class CubeController(Node):
         goal.trajectory.points.append(point)
         self._gripper_client.send_goal_async(goal)
 
-    def send_pose_goal(self, x, y, z, wait=True):
+    # def send_pose_goal(self, x, y, z, wait=True, strict_constraints=True):
+    #     goal_msg = MoveGroup.Goal()
+    #     goal_msg.request.group_name = 'arm'
+    #     goal_msg.request.num_planning_attempts = 20  # 시도 횟수 늘림
+    #     goal_msg.request.allowed_planning_time = 5.0
+    #     goal_msg.request.max_velocity_scaling_factor = 0.2
+    #     goal_msg.request.max_acceleration_scaling_factor = 0.2
+
+    #     # 1. 위치 제약 (Position Constraint) - 그대로 유지
+    #     pcm = PositionConstraint()
+    #     pcm.header.frame_id = 'base'
+    #     pcm.link_name = 'link6'
+    #     pcm.weight = 1.0
+    #     target_pose = Pose()
+    #     target_pose.position.x = x
+    #     target_pose.position.y = y
+    #     target_pose.position.z = z
+    #     target_pose.orientation.w = 1.0
+    #     pcm.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.02])] # 0.01 -> 0.02 약간 여유
+    #     pcm.constraint_region.primitive_poses = [target_pose]
+
+    #     # 2. 방향 제약 (Orientation Constraint) - 상황에 따라 조절
+    #     ocm = OrientationConstraint()
+    #     ocm.header.frame_id = 'base'
+    #     ocm.link_name = 'link6'
+    #     ocm.orientation = Quaternion(x=0.707, y=0.707, z=0.0, w=0.0)
+    #     ocm.weight = 1.0
+        
+    #     if strict_constraints:
+    #         # 접근할 때(Hover): 정확하게 정렬해야 함
+    #         ocm.absolute_x_axis_tolerance = 0.2 # 0.1 -> 0.2 약간 완화
+    #         ocm.absolute_y_axis_tolerance = 0.2
+    #         ocm.absolute_z_axis_tolerance = 0.1
+    #     else:
+    #         # 들어올릴 때(Lift): 쏟지 않을 정도만 유지 (많이 풀어줌)
+    #         ocm.absolute_x_axis_tolerance = 0.5
+    #         ocm.absolute_y_axis_tolerance = 0.5
+    #         ocm.absolute_z_axis_tolerance = 0.1
+    #     goal_msg.request.goal_constraints.append(Constraints(position_constraints=[pcm], orientation_constraints=[ocm]))
+        
+    #     future = self._arm_client.send_goal_async(goal_msg)
+    #     if wait:
+    #         future.add_done_callback(self.on_hover_complete)
+    #     return future
+
+    # [수정] linear_motion 인자 추가
+    def send_pose_goal(self, x, y, z, wait=True, strict_constraints=True, linear_motion=False):
         goal_msg = MoveGroup.Goal()
         goal_msg.request.group_name = 'arm'
-        goal_msg.request.num_planning_attempts = 10
         goal_msg.request.allowed_planning_time = 5.0
         goal_msg.request.max_velocity_scaling_factor = 0.2
         goal_msg.request.max_acceleration_scaling_factor = 0.2
+        
+        # [핵심] 직선 운동 모드일 때 플래너 변경
+        if linear_motion:
+            # Pilz Industrial Motion Planner의 'LIN' (직선) 알고리즘 사용
+            goal_msg.request.planner_id = "LIN" 
+            goal_msg.request.num_planning_attempts = 1 # LIN은 계산이 한 번이면 끝남
+        else:
+            # 일반 이동은 기존 RRTConnect 사용
+            goal_msg.request.planner_id = "RRTConnect"
+            goal_msg.request.num_planning_attempts = 20
 
         pcm = PositionConstraint()
         pcm.header.frame_id = 'base'
@@ -152,17 +223,27 @@ class CubeController(Node):
         target_pose.position.y = y
         target_pose.position.z = z
         target_pose.orientation.w = 1.0
-        pcm.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.01])]
+        pcm.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.02])]
         pcm.constraint_region.primitive_poses = [target_pose]
 
         ocm = OrientationConstraint()
         ocm.header.frame_id = 'base'
         ocm.link_name = 'link6'
-        ocm.orientation = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
-        ocm.absolute_x_axis_tolerance = 0.1
-        ocm.absolute_y_axis_tolerance = 0.1
-        ocm.absolute_z_axis_tolerance = 3.14
+        
+        # 앞(x=1.0)을 보는 자세로 고정
+        ocm.orientation = Quaternion(x=0.707, y=0.707, z=0.0, w=0.0)
         ocm.weight = 1.0
+        
+        if strict_constraints:
+            # 접근 및 하강: 자세 꽉 잠금
+            ocm.absolute_x_axis_tolerance = 0.1
+            ocm.absolute_y_axis_tolerance = 0.1
+            ocm.absolute_z_axis_tolerance = 0.1 
+        else:
+            # 들어올리기: 조금 풀어줌
+            ocm.absolute_x_axis_tolerance = 0.5 
+            ocm.absolute_y_axis_tolerance = 0.5
+            ocm.absolute_z_axis_tolerance = 3.14
 
         goal_msg.request.goal_constraints.append(Constraints(position_constraints=[pcm], orientation_constraints=[ocm]))
         
