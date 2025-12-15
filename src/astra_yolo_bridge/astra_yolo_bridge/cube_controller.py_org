@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+# [수정] Pose 추가 임포트
+from geometry_msgs.msg import PoseStamped, Point, Quaternion, Pose 
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import Constraints, JointConstraint, PositionConstraint, OrientationConstraint, BoundingVolume
+from shape_msgs.msg import SolidPrimitive
+from tf2_ros import Buffer, TransformListener
+import time
+
+class CubeController(Node):
+    def __init__(self):
+        super().__init__('cube_controller')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self._action_client = ActionClient(self, MoveGroup, 'move_action')
+
+        self.get_logger().info("Waiting for MoveGroup action server...")
+        self._action_client.wait_for_server()
+        self.get_logger().info("MoveGroup Ready!")
+
+        # 5초 후 이동
+        self.timer = self.create_timer(5.0, self.move_to_cube)
+
+    # def move_to_cube(self):
+    #     self.timer.cancel()
+        
+    #     # 1. 큐브 위치 조회
+    #     try:
+    #         trans = self.tf_buffer.lookup_transform('base', 'cube_target', rclpy.time.Time())
+    #     except Exception as e:
+    #         self.get_logger().error(f"Cube Not Found: {e}")
+    #         return
+
+    #     x = trans.transform.translation.x
+    #     y = trans.transform.translation.y
+    #     z = trans.transform.translation.z + 0.08 # 8cm 위 (찍지 않게 조심)
+
+    #     self.get_logger().warn(f"🚀 Goal: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
+    def move_to_cube(self):
+        # [수정] 타이머를 바로 끄지 않습니다! 성공할 때만 끕니다.
+        
+        # 1. 큐브 위치 조회
+        try:
+            # 타임아웃을 0.5초 줘서 기다리게 함
+            trans = self.tf_buffer.lookup_transform(
+                'base', 'cube_target', rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.5)
+            )
+        except Exception as e:
+            # [수정] 실패하면 에러 로그 찍고, 다음 타이머 주기(1초 뒤)에 다시 시도!
+            self.get_logger().warn("Waiting for cube... (Place cube in front of camera)")
+            return 
+
+        # --- 여기까지 왔으면 큐브 찾은 것임! ---
+        self.timer.cancel() # [중요] 이제서야 타이머를 끕니다 (한 번만 움직이기 위해)
+
+        x = trans.transform.translation.x
+        y = trans.transform.translation.y
+        z = trans.transform.translation.z + 0.20 # 8cm 위
+        self.get_logger().info(f"✅ Target Found! 🚀 Goal: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
+       
+        # 2. 목표 메시지 생성
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.workspace_parameters.header.frame_id = 'base'
+        goal_msg.request.workspace_parameters.min_corner.x = -1.0
+        goal_msg.request.workspace_parameters.min_corner.y = -1.0
+        goal_msg.request.workspace_parameters.min_corner.z = -1.0
+        goal_msg.request.workspace_parameters.max_corner.x = 1.0
+        goal_msg.request.workspace_parameters.max_corner.y = 1.0
+        goal_msg.request.workspace_parameters.max_corner.z = 1.0
+        
+        goal_msg.request.group_name = 'arm'
+        goal_msg.request.num_planning_attempts = 10
+        goal_msg.request.allowed_planning_time = 5.0
+        goal_msg.request.max_velocity_scaling_factor = 0.1
+        goal_msg.request.max_acceleration_scaling_factor = 0.1
+
+        # 위치 제약 조건 설정
+        pcm = PositionConstraint()
+        pcm.header.frame_id = 'base'
+        pcm.link_name = 'link6'
+        pcm.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.01])]
+        
+        # [수정된 부분] Pose()를 올바르게 생성
+        target_pose = Pose()
+        target_pose.position.x = x
+        target_pose.position.y = y
+        target_pose.position.z = z
+        # 방향은 의미 없지만 초기화 (w=1.0)
+        target_pose.orientation.w = 1.0
+        
+        pcm.constraint_region.primitive_poses = [target_pose]
+        pcm.weight = 1.0
+
+        # 방향 제약 조건 설정 (아래 보기)
+        ocm = OrientationConstraint()
+        ocm.header.frame_id = 'base'
+        ocm.link_name = 'link6'
+        # 그리퍼가 바닥을 보는 방향 (로봇마다 다를 수 있음, 일단 기본값)
+        ocm.orientation = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
+        ocm.absolute_x_axis_tolerance = 0.5
+        ocm.absolute_y_axis_tolerance = 0.5
+        ocm.absolute_z_axis_tolerance = 3.14
+        ocm.weight = 1.0
+
+        goal_msg.request.goal_constraints.append(Constraints(position_constraints=[pcm], orientation_constraints=[ocm]))
+
+        # 3. 전송
+        self.get_logger().info("Sending goal...")
+        self._send_goal_future = self._action_client.send_goal_async(goal_msg)
+        self._send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('Goal rejected :(')
+            return
+        self.get_logger().info('Goal accepted! Moving...')
+        self._get_result_future = goal_handle.get_result_async()
+        self._get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        result = future.result().result
+        if result.error_code.val == 1: # SUCCESS
+            self.get_logger().info('🎉 Arrival Complete!')
+        else:
+            self.get_logger().error(f'❌ Failed with error code: {result.error_code.val}')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CubeController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

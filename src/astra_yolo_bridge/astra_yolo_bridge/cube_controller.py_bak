@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from geometry_msgs.msg import PoseStamped, Point, Quaternion, Pose
+from moveit_msgs.action import MoveGroup
+from moveit_msgs.msg import Constraints, JointConstraint, PositionConstraint, OrientationConstraint
+from shape_msgs.msg import SolidPrimitive
+from tf2_ros import Buffer, TransformListener
+import time
+
+# # 로봇 관절 이름 (MyCobot 표준)
+# JOINT_NAMES = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6']
+# [수정] 진짜 관절 이름 리스트
+JOINT_NAMES = [
+    'joint2_to_joint1',
+    'joint3_to_joint2',
+    'joint4_to_joint3',
+    'joint5_to_joint4',
+    'joint6_to_joint5',
+    'joint6output_to_joint6'
+]
+class CubeController(Node):
+    def __init__(self):
+        super().__init__('cube_controller')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._action_client = ActionClient(self, MoveGroup, 'move_action')
+
+        # 상태 관리 (0:대기, 1:큐브이동중, 2:홈이동중)
+        self.state = 0 
+        self.get_logger().info("Waiting for MoveGroup...")
+        self._action_client.wait_for_server()
+        self.get_logger().info("✅ Ready! Loop: Cube -> Home -> Cube...")
+
+        # 1초마다 상태를 체크해서 다음 행동을 결정합니다.
+        self.timer = self.create_timer(1.0, self.control_loop)
+
+    def control_loop(self):
+        # 상태 0: 큐브 찾고 이동 명령 내리기
+        if self.state == 0:
+            self.find_and_move_to_cube()
+        
+        # 상태 10: 홈으로 이동 명령 내리기 (큐브 잡은 후)
+        elif self.state == 10:
+            self.move_to_home()
+
+    # def find_and_move_to_cube(self):
+    #     try:
+    #         trans = self.tf_buffer.lookup_transform('base', 'cube_target', rclpy.time.Time())
+    #     except Exception:
+    #         self.get_logger().warn("🔍 Searching for cube...")
+    #         return
+
+    #     # 큐브 발견!
+    #     x = trans.transform.translation.x
+    #     y = trans.transform.translation.y
+    #     # [중요] 그리퍼 길이 고려 (20cm 위) - 필요시 조절하세요 (0.18 ~ 0.22)
+    #     z = trans.transform.translation.z + 0.20 
+
+    #     self.get_logger().info(f"📍 Cube Found! Moving to X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
+        
+    #     # 이동 명령 전송
+    #     if self.send_pose_goal(x, y, z):
+    #         self.state = 1 # 이동 중 상태로 변경 (중복 명령 방지)
+
+# [수정] 큐브 접근 및 그립 동작 분리
+    def find_and_move_to_cube(self):
+        try:
+            trans = self.tf_buffer.lookup_transform('base', 'cube_target', rclpy.time.Time())
+        except Exception:
+            self.get_logger().warn("🔍 Searching for cube...")
+            return
+
+        x = trans.transform.translation.x
+        y = trans.transform.translation.y
+        z_target = trans.transform.translation.z
+        
+        # [1단계] 큐브 위 25cm 지점까지 먼저 이동 (접근 대기)
+        z_hover = z_target + 0.25
+        self.get_logger().info(f"🚁 Hovering above cube...")
+        if not self.send_pose_goal(x, y, z_hover):
+            return # 실패하면 중단
+
+        time.sleep(0.5) # 잠시 안정화
+
+        # [2단계] 큐브 잡는 위치(예: 18cm)로 수직 하강
+        z_grip = z_target + 0.18 # 높이 조절 필요
+        self.get_logger().info(f"⬇️ Descending to grip...")
+        if self.send_pose_goal(x, y, z_grip):
+            self.state = 1 # 성공 시 다음 단계로
+
+
+
+
+
+
+
+
+
+    # def move_to_home(self):
+    #     self.get_logger().info("🏠 Going Home...")
+    #     if self.send_joint_goal([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]):
+    #         self.state = 2 # 홈 이동 중
+    def move_to_home(self):
+        self.get_logger().info("🏠 Going Home...")
+        
+        # 홈 위치 (모든 관절 0도)
+        home_joints = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        
+        # 'send_joint_goal' 함수를 사용해서 이동 명령을 내립니다.
+        if self.send_joint_goal(home_joints):
+            self.state = 2 # 홈 이동 중 상태로 변경
+    def send_pose_goal(self, x, y, z):
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = 'arm'
+        goal_msg.request.num_planning_attempts = 10
+        goal_msg.request.allowed_planning_time = 5.0
+        goal_msg.request.max_velocity_scaling_factor = 0.5
+        goal_msg.request.max_acceleration_scaling_factor = 0.5
+
+        # 위치 제약
+        pcm = PositionConstraint()
+        pcm.header.frame_id = 'base'
+        pcm.link_name = 'link6'
+        pcm.weight = 1.0
+        target_pose = Pose()
+        target_pose.position.x = x
+        target_pose.position.y = y
+        target_pose.position.z = z
+        target_pose.orientation.w = 1.0
+        pcm.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.01])]
+        pcm.constraint_region.primitive_poses = [target_pose]
+
+        # 방향 제약 (아래 보기)
+        ocm = OrientationConstraint()
+        ocm.header.frame_id = 'base'
+        ocm.link_name = 'link6'
+        ocm.orientation = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
+        ocm.absolute_x_axis_tolerance = 0.1 # 관대하게
+        ocm.absolute_y_axis_tolerance = 0.1
+        ocm.absolute_z_axis_tolerance = 3.14 # 회전 자유
+        ocm.weight = 1.0
+
+        goal_msg.request.goal_constraints.append(Constraints(position_constraints=[pcm], orientation_constraints=[ocm]))
+        
+        future = self._action_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.cube_done_cb)
+        return True
+
+    def send_joint_goal(self, joints):
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = 'arm'
+        goal_msg.request.num_planning_attempts = 10
+        goal_msg.request.max_velocity_scaling_factor = 0.5
+        goal_msg.request.max_acceleration_scaling_factor = 0.5
+
+        jc_list = []
+        for i, val in enumerate(joints):
+            jc = JointConstraint()
+            jc.joint_name = JOINT_NAMES[i]
+            jc.position = val
+            jc.tolerance_above = 0.01
+            jc.tolerance_below = 0.01
+            jc.weight = 1.0
+            jc_list.append(jc)
+
+        goal_msg.request.goal_constraints.append(Constraints(joint_constraints=jc_list))
+        
+        future = self._action_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.home_done_cb)
+        return True
+
+    def cube_done_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.state = 0 # 실패하면 다시 검색
+            return
+        
+        # 이동이 끝나면 결과 받기
+        res_future = goal_handle.get_result_async()
+        res_future.add_done_callback(self.cube_arrived)
+
+    def cube_arrived(self, future):
+        # 큐브 도착 완료!
+        self.get_logger().info("📦 Arrived at Cube! (Gripping...)")
+        time.sleep(2.0) # 잡는 척 (2초 대기)
+        self.state = 10 # 다음 단계: 홈으로 가라!
+
+    def home_done_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.state = 10 # 실패하면 다시 홈 시도
+            return
+        res_future = goal_handle.get_result_async()
+        res_future.add_done_callback(self.home_arrived)
+
+    def home_arrived(self, future):
+        # 홈 도착 완료!
+        self.get_logger().info("🏠 Arrived Home! Restarting...")
+        time.sleep(1.0)
+        self.state = 0 # 다시 처음(큐브 검색)으로 리셋!
+
+def main():
+    rclpy.init()
+    node = CubeController()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
