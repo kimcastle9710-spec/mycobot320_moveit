@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="firefighter">
+    
+    <xacro:arg name="initial_positions_file" default="$(find adaptive_gripper_config)/config/initial_positions.yaml" />
+
+    <xacro:include filename="$(find mycobot_description)/urdf/mycobot_320_m5_2022/mycobot_320_m5_2022_adaptive_gripper.urdf" />
+
+    <xacro:include filename="firefighter.ros2_control.xacro" />
+
+    <xacro:firefighter_ros2_control name="MyCobot" initial_positions_file="$(arg initial_positions_file)"/>
+
+</robot>
