@@ -6,14 +6,10 @@
 #include <memory>
 #include <vector>
 #include <array>
-#include <algorithm> 
-#include <thread>    
+#include <algorithm> // for copy_n
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
-
-// [중요] MyCobot 라이브러리 헤더 포함
-#include "mycobot/mycobot.hpp" 
 
 namespace mycobot
 {
@@ -30,9 +26,10 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_init(
   serial_port_ = info_.hardware_parameters["serial_port"];
   baud_rate_ = std::stoi(info_.hardware_parameters["baud_rate"]);
 
+  // hw_commands_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
+  // hw_states_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   hw_commands_.resize(info_.joints.size(), 0.0);
   hw_states_.resize(info_.joints.size(), 0.0);
-  
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -40,8 +37,13 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_configure(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   try {
+    // [수정] 생성자에서 포트와 보드레이트를 넣으면 내부적으로 연결 시도함
+    // open()이나 is_open() 함수가 없으므로 호출하지 않음
     mycobot_ = std::make_unique<MyCobot>(serial_port_, baud_rate_);
+    
+    // 연결 안정화 대기
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
   } catch (const std::exception & e) {
     RCLCPP_ERROR(rclcpp::get_logger("MyCobotHardwareInterface"), "Exception during connection: %s", e.what());
     return hardware_interface::CallbackReturn::ERROR;
@@ -95,27 +97,58 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_deactivate(
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
+// hardware_interface::return_type MyCobotHardwareInterface::read(
+//   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+// {
+//   if (!mycobot_) return hardware_interface::return_type::ERROR;
+
+//   // [수정] get_radians() 사용 (리턴 타입: fp::Result<std::array<double, 6>>)
+//   auto result = mycobot_->get_radians(); 
+  
+//   // fp::Result 처리 (유효한 값이 있는지 확인)
+//   if (result) { // 혹은 result.has_value() 
+//       auto angles = *result; // 값 추출
+//       if (angles.size() == hw_states_.size()) {
+//           for (size_t i = 0; i < angles.size(); ++i) {
+//               hw_states_[i] = angles[i]; 
+//           }
+//       }
+//   } else {
+//       // 읽기 실패 시 에러 로그를 띄우거나 무시 (너무 자주 뜨면 주석 처리)
+//       // RCLCPP_WARN(rclcpp::get_logger("MyCobotHardwareInterface"), "Failed to read angles");
+//   }
+  
+//   return hardware_interface::return_type::OK;
+// }
+
 hardware_interface::return_type MyCobotHardwareInterface::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
   if (!mycobot_) return hardware_interface::return_type::ERROR;
 
   auto result = mycobot_->get_radians();
+  
   if (result) { 
+      // 데이터가 있으면 업데이트
       auto angles = *result; 
       if (angles.size() == hw_states_.size()) {
           for (size_t i = 0; i < angles.size(); ++i) {
               hw_states_[i] = angles[i]; 
           }
       }
-  } 
+  } else {
+      // [수정] 데이터 읽기 실패 시 경고 로그 출력 (NaN 에러 대신 로그 확인용)
+      static int log_counter = 0;
+      if (log_counter++ % 100 == 0) { 
+          RCLCPP_WARN(rclcpp::get_logger("MyCobotHardwareInterface"), "로봇에서 각도를 읽을 수 없습니다! USB 연결을 확인하세요.");
+      }
+      // 값을 업데이트하지 않고 기존 값(또는 0.0) 유지 -> TF 에러 방지
+  }
   
   return hardware_interface::return_type::OK;
 }
 
-// -----------------------------------------------------------------------------------------
-// [최종 정답] 제공해주신 헤더파일(mycobot.hpp, command.hpp)에 맞춘 코드
-// -----------------------------------------------------------------------------------------
+
 hardware_interface::return_type MyCobotHardwareInterface::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
@@ -125,43 +158,20 @@ hardware_interface::return_type MyCobotHardwareInterface::write(
       return hardware_interface::return_type::OK;
   }
 
-  // 1. 로봇 팔 제어 (Joint 1 ~ 6)
+  // [수정] send_radians() 사용을 위해 std::vector -> std::array 변환
   std::array<double, 6> commands_array;
   if (hw_commands_.size() >= 6) {
       std::copy_n(hw_commands_.begin(), 6, commands_array.begin());
-      // [참고] mycobot.hpp에 send_radians 함수 존재함 
+      
+      // send_radians(각도, 속도) 호출. 속도는 0~100 사이. 80 정도로 설정.
       mycobot_->send_radians(commands_array, 80);
-  }
-
-  // 2. 그리퍼 제어 (Gripper Controller)
-  for (size_t i = 0; i < info_.joints.size(); ++i) {
-      if (info_.joints[i].name == "gripper_controller") {
-          double cmd = hw_commands_[i];
-          
-          static int last_sent_state = -1; 
-
-          // 닫기 명령 (값 < -0.5)
-          if (cmd < -0.5 && last_sent_state != 1) {
-              // [핵심] set_gripper_state 함수(command.hpp)로 Command 객체 생성 후 send() 호출
-              // 1: Close, 50: Speed 
-              mycobot_->send(set_gripper_state(1, 50)); 
-              last_sent_state = 1; 
-          } 
-          // 열기 명령 (값 > -0.2)
-          else if (cmd > -0.2 && last_sent_state != 0) {
-              // 0: Open, 50: Speed 
-              mycobot_->send(set_gripper_state(0, 50));
-              last_sent_state = 0; 
-          }
-      }
   }
 
   return hardware_interface::return_type::OK;
 }
 
-} // namespace mycobot
+}  // namespace mycobot
 
 #include "pluginlib/class_list_macros.hpp"
-
 PLUGINLIB_EXPORT_CLASS(
   mycobot::MyCobotHardwareInterface, hardware_interface::SystemInterface)
