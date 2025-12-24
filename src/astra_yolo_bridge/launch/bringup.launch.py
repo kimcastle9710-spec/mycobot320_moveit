@@ -67,7 +67,8 @@ def generate_launch_description():
         # X=0.35, Y=0, Z=0.60
         # Yaw=0, Pitch=1.57(90도 숙임), Roll=0
         # Parent=base, Child=camera_link
-        arguments=['-0.35', '0.0', '0.60', '0.0', '1.57', '0.0', 'base', 'camera_link']
+       # [수정 후] 8cm 당겨줌
+        arguments=['-0.27', '0.0', '0.60', '0.0', '1.57', '0.0', 'base', 'camera_link']
     )
     return LaunchDescription([
         model_path_arg,

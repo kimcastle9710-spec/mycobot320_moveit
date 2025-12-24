@@ -6,14 +6,10 @@
 #include <memory>
 #include <vector>
 #include <array>
-#include <algorithm> 
-#include <thread>    
+#include <algorithm> // for copy_n
 
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
-
-// [중요] MyCobot 라이브러리 헤더 포함
-#include "mycobot/mycobot.hpp" 
 
 namespace mycobot
 {
@@ -30,9 +26,10 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_init(
   serial_port_ = info_.hardware_parameters["serial_port"];
   baud_rate_ = std::stoi(info_.hardware_parameters["baud_rate"]);
 
+  // hw_commands_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
+  // hw_states_.resize(info_.joints.size(), std::numeric_limits<double>::quiet_NaN());
   hw_commands_.resize(info_.joints.size(), 0.0);
   hw_states_.resize(info_.joints.size(), 0.0);
-  
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -40,8 +37,13 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_configure(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
   try {
+    // [수정] 생성자에서 포트와 보드레이트를 넣으면 내부적으로 연결 시도함
+    // open()이나 is_open() 함수가 없으므로 호출하지 않음
     mycobot_ = std::make_unique<MyCobot>(serial_port_, baud_rate_);
+    
+    // 연결 안정화 대기
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
   } catch (const std::exception & e) {
     RCLCPP_ERROR(rclcpp::get_logger("MyCobotHardwareInterface"), "Exception during connection: %s", e.what());
     return hardware_interface::CallbackReturn::ERROR;
@@ -95,63 +97,110 @@ hardware_interface::CallbackReturn MyCobotHardwareInterface::on_deactivate(
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
+
 hardware_interface::return_type MyCobotHardwareInterface::read(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
   if (!mycobot_) return hardware_interface::return_type::ERROR;
 
+  // 1. 하드웨어에서 6개 관절 값 가져오기 (무조건 J1, J2, J3, J4, J5, J6 순서)
   auto result = mycobot_->get_radians();
-  if (result) { 
+
+  if (result) {
       auto angles = *result; 
-      if (angles.size() == hw_states_.size()) {
-          for (size_t i = 0; i < angles.size(); ++i) {
-              hw_states_[i] = angles[i]; 
+
+      // 2. ROS가 요구하는 관절 순서(info_.joints)를 하나씩 확인하며 "제 짝"을 찾아줌
+      for (size_t i = 0; i < info_.joints.size(); ++i) {
+          std::string name = info_.joints[i].name;
+          double val = 0.0;
+          bool is_arm_joint = false;
+
+          // [핵심] 이름표를 보고 angles의 몇 번째 값을 가져올지 매핑
+          if (name == "joint2_to_joint1") {       // URDF: Joint 1
+              val = angles[0]; is_arm_joint = true;
+          } 
+          else if (name == "joint3_to_joint2") {  // URDF: Joint 2
+              val = angles[1]; is_arm_joint = true;
+          }
+          else if (name == "joint4_to_joint3") {  // URDF: Joint 3
+              val = angles[2]; is_arm_joint = true;
+          }
+          else if (name == "joint5_to_joint4") {  // URDF: Joint 4
+              val = angles[3]; is_arm_joint = true;
+          }
+          else if (name == "joint6_to_joint5") {  // URDF: Joint 5
+              val = angles[4]; is_arm_joint = true;
+          }
+          else if (name == "joint6output_to_joint6") { // URDF: Joint 6 (Mimic)
+              val = angles[5]; is_arm_joint = true;
+          }
+          else if (name == "gripper_controller") { // 그리퍼
+              hw_states_[i] = hw_commands_[i];     // Loopback
+              continue; 
+          }
+
+          // 3. 값 정규화 (-3.14 ~ +3.14) 후 대입
+          if (is_arm_joint) {
+              while (val > M_PI) val -= 2.0 * M_PI;
+              while (val < -M_PI) val += 2.0 * M_PI;
+              hw_states_[i] = val;
           }
       }
-  } 
-  
+  }
+
   return hardware_interface::return_type::OK;
 }
 
-// -----------------------------------------------------------------------------------------
-// [최종 정답] 제공해주신 헤더파일(mycobot.hpp, command.hpp)에 맞춘 코드
-// -----------------------------------------------------------------------------------------
 hardware_interface::return_type MyCobotHardwareInterface::write(
   const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
   if (!mycobot_) return hardware_interface::return_type::ERROR;
 
+  // NaN(유효하지 않은 값) 체크
   if (std::any_of(hw_commands_.begin(), hw_commands_.end(), [](double val){ return std::isnan(val); })) {
       return hardware_interface::return_type::OK;
   }
 
-  // 1. 로봇 팔 제어 (Joint 1 ~ 6)
+  // ---------------------------------------------------------
+  // 1. 로봇 팔 제어 (과부하 방지 필터 추가)
+  // ---------------------------------------------------------
   std::array<double, 6> commands_array;
   if (hw_commands_.size() >= 6) {
       std::copy_n(hw_commands_.begin(), 6, commands_array.begin());
-      // [참고] mycobot.hpp에 send_radians 함수 존재함 
-      mycobot_->send_radians(commands_array, 80);
+
+      // [핵심] 이전 명령과 비교해서 변화가 미미하면 전송 스킵!
+      static std::array<double, 6> last_commands = {0};
+      double total_diff = 0.0;
+      
+      for(size_t i=0; i<6; ++i) {
+          total_diff += std::abs(commands_array[i] - last_commands[i]);
+      }
+
+      // 변화량 합계가 0.02 라디안(약 1도) 미만이면 명령 안 보냄 (떨림 방지)
+      // *주의: 움직임이 너무 끊기면 이 값을 0.01로 줄이세요.
+      if (total_diff > 0.02) { 
+          mycobot_->send_radians(commands_array, 80); // 속도 80%
+          last_commands = commands_array; // 마지막 명령 업데이트
+      }
   }
 
-  // 2. 그리퍼 제어 (Gripper Controller)
+  // ---------------------------------------------------------
+  // 2. 그리퍼 제어 (중복 전송 방지 포함됨)
+  // ---------------------------------------------------------
   for (size_t i = 0; i < info_.joints.size(); ++i) {
       if (info_.joints[i].name == "gripper_controller") {
           double cmd = hw_commands_[i];
-          
-          static int last_sent_state = -1; 
+          static int last_gripper_state = -1; 
 
-          // 닫기 명령 (값 < -0.5)
-          if (cmd < -0.5 && last_sent_state != 1) {
-              // [핵심] set_gripper_state 함수(command.hpp)로 Command 객체 생성 후 send() 호출
-              // 1: Close, 50: Speed 
+          // 닫기 (-0.5 미만)
+          if (cmd < -0.5 && last_gripper_state != 1) {
               mycobot_->send(set_gripper_state(1, 50)); 
-              last_sent_state = 1; 
+              last_gripper_state = 1; 
           } 
-          // 열기 명령 (값 > -0.2)
-          else if (cmd > -0.2 && last_sent_state != 0) {
-              // 0: Open, 50: Speed 
+          // 열기 (-0.2 초과)
+          else if (cmd > -0.2 && last_gripper_state != 0) {
               mycobot_->send(set_gripper_state(0, 50));
-              last_sent_state = 0; 
+              last_gripper_state = 0; 
           }
       }
   }
@@ -159,9 +208,8 @@ hardware_interface::return_type MyCobotHardwareInterface::write(
   return hardware_interface::return_type::OK;
 }
 
-} // namespace mycobot
+}  // namespace mycobot
 
 #include "pluginlib/class_list_macros.hpp"
-
 PLUGINLIB_EXPORT_CLASS(
   mycobot::MyCobotHardwareInterface, hardware_interface::SystemInterface)
