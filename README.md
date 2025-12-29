@@ -95,12 +95,3 @@ trajectory_msgs/msg/JointTrajectory "{
   points: [{positions: [0.0], time_from_start: {sec: 1}}]
 }"
 
-📂 Repository Structure
-src/
- ├─ mycobot/
- │   ├─ mycobot_hardware_interface/   # Custom ROS2 Control Interface
- │   └─ mycobot/                      # myCobot SDK 기반 제어 코드
- ├─ adaptive_gripper_config/          # MoveIt2 gripper configuration
- ├─ ros2_astra_camera/                # Astra camera ROS2 node
- ├─ astra_yolo_bridge/                # Vision integration
- └─ astra_capture.py                  # Camera capture utility
